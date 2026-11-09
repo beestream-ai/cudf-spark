@@ -1,6 +1,6 @@
 # The `feature/tornadovm-udf-fallback` branch
 
-This branch exists to support **[beehive-lab/spark-jitudf](https://github.com/beehive-lab/spark-jitudf)**,
+This branch exists to support **[beestream-ai/spark-jitudf](https://github.com/beestream-ai/spark-jitudf)**,
 which compiles a Spark JVM UDF into a GPU kernel with TornadoVM and runs it over the cuDF column
 buffers in place.
 
@@ -24,14 +24,14 @@ Before this branch, the decline was reported only as a failure to translate. Aft
 | `LogicalPlanRules`, `GpuScalaUDF` | Let that second attempt happen during planning, so a UDF that cannot be compiled keeps exactly the path it already had. |
 
 The provider class is named by `spark.rapids.sql.tornadovm.provider`, defaulting to
-`io.github.beehivelab.jitudf.TornadoUdfProvider`. Nothing changes until the config is set: with the
+`ai.beestream.jitudf.TornadoUdfProvider`. Nothing changes until the config is set: with the
 feature off, this branch behaves as the release it was cut from.
 
 ## Building it
 
 `scripts/build-rapids-patch.sh` in spark-jitudf builds the changed sources through this project's
 own reactor and replaces exactly those classes in the released distribution jar. See
-[REPRODUCING.md](https://github.com/beehive-lab/spark-jitudf/blob/main/REPRODUCING.md) there.
+[REPRODUCING.md](https://github.com/beestream-ai/spark-jitudf/blob/main/REPRODUCING.md) there.
 
 ## Relationship to upstream
 

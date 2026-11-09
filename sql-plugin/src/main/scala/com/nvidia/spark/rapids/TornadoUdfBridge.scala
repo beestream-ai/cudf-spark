@@ -53,7 +53,7 @@ object TornadoUdfBridge extends Logging {
   /** Class name of the provider, overridable for testing a different implementation. */
   val PROVIDER_KEY = "spark.rapids.sql.tornadovm.provider"
 
-  private val DEFAULT_PROVIDER = "io.github.beehivelab.jitudf.TornadoUdfProvider"
+  private val DEFAULT_PROVIDER = "ai.beestream.jitudf.TornadoUdfProvider"
 
   /**
    * How many UDFs the decision log keeps. A driver that serves queries for weeks sees an unbounded

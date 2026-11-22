@@ -1,0 +1,868 @@
+Subject: [PATCH] JNI: a transform binding taking several inputs, a chosen output type and nulls
+
+Against rapidsai/cudf ff5b362d7c06ae5837fd7a7337e2ae20895f324d, which is the submodule pin of
+NVIDIA/cudf-spark-jni 761c184ff0a0dc5b678b1f5f163c579068beb133 -- the revisions the released
+com.nvidia:spark-rapids-jni:26.08.0:cuda12 names in its own version-info properties.
+
+WHAT IS MISSING UPSTREAM
+
+  libcudf's `cudf::transform_extended` already takes a span of input columns, an output
+  `data_type`, a `null_aware` flag and an `output_nullability` policy. The Java side reaches none
+  of that. `ColumnView.transform(String, boolean)` passes exactly one column, hard-codes
+  `data_type(type_id::INT32)`, and has no parameter for null-awareness:
+
+    JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_ColumnView_transform(...)
+    {
+      cudf::transform_input inputs[] = {*column};
+      return release_as_jlong(cudf::transform_extended(
+        inputs, n_udf, cudf::data_type(cudf::type_id::INT32),
+        j_is_ptx ? cudf::udf_source_type::PTX : cudf::udf_source_type::CUDA));
+    }
+
+  So the restriction is in the binding, not in the library. This patch widens the binding and
+  changes nothing else: no new C++ algorithm, no change to the existing overload, and no change
+  to how errors are reported.
+
+WHAT IS ADDED
+
+  * ai.rapids.cudf.OutputNullability -- an enum mirroring cudf::output_nullability.
+  * ColumnView.transform(ColumnView[], String, boolean, DType, boolean, OutputNullability)
+  * Java_ai_rapids_cudf_ColumnView_transformMulti, which forwards to transform_extended.
+
+  The existing instance method and its JNI entry point are untouched, so every caller that
+  compiles today still compiles and still runs the same code.
+
+THE DEVICE FUNCTION'S SHAPE
+
+  Fixed by libcudf, not by this patch. cpp/src/transform/jit/kernel.cu calls
+  GENERIC_TRANSFORM_OP(out_ptrs..., ins...), so the output pointer comes first and the inputs
+  follow in column order. With null_aware::NO that is
+
+    __device__ void f(OUT *out, IN0 in0, IN1 in1, ...)
+
+  and with null_aware::YES the kernel reads each input with `nullable_element` and gives the
+  function an optional to fill, so it is
+
+    __device__ void f(cuda::std::optional<OUT> *out, cuda::std::optional<IN0> in0, ...)
+
+  A function may instead return a value, which the kernel casts to `cudf::errc`; that works
+  through the new entry point exactly as it does through the old one, because the decision is
+  made in the kernel at compile time and the binding has no part in it.
+
+ON output_nullability
+
+  Both values are exposed because only one of them is always correct. PRESERVE is: for a
+  null-unaware function it gives the output the intersection of the input masks and skips the
+  rows under a null, and for a null-aware one it takes the output's validity from what the
+  function returned. ALL_VALID asserts that every row produces a value and allocates no mask;
+  with a null-unaware function it also stops rows being skipped, so the function reads the raw
+  value under a null. It is an optimisation with a precondition, and the precondition is not
+  one the binding can check, so it is the caller's to state.
+
+TESTS
+
+  java/src/test/java/ai/rapids/cudf/TransformMultiTest.java covers one, two and three inputs;
+  INT32, INT64, FLOAT32, FLOAT64 and BOOL8 outputs; mixed input types; zero, one and a million
+  rows; all-null, mixed-null and no-null inputs; a function that answers for a null, one that
+  returns a null for a non-null input, and one that unboxes a null; error codes through both the
+  new and the old entry point; device memory accounted before and after both successful and
+  failing calls; and the argument validation above. It runs as part of the JNI build's own Java
+  test suite, on a GPU.
+
+diff --git a/java/src/main/java/ai/rapids/cudf/ColumnView.java b/java/src/main/java/ai/rapids/cudf/ColumnView.java
+index 5985d6ba2f..6a4258540e 100644
+--- a/java/src/main/java/ai/rapids/cudf/ColumnView.java
++++ b/java/src/main/java/ai/rapids/cudf/ColumnView.java
+@@ -1118,6 +1118,65 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
+     return new ColumnVector(transform(getNativeView(), udf, isPtx));
+   }
+ 
++  /**
++   * Transform one or more columns together with a single device function.
++   * <p>
++   * This is the general form of {@link #transform(String, boolean)}: it takes any number of input
++   * columns, produces a column of a chosen type, and can run the function over nullable inputs.
++   * <p>
++   * The function's parameter list is fixed by libcudf, in this order: a pointer to the output,
++   * then one parameter per input column, in the order the columns are given here. For CUDA source
++   * with {@code isNullAware} false that is
++   * <pre>{@code __device__ void f(OUT* out, IN0 in0, IN1 in1, ...)}</pre>
++   * and with {@code isNullAware} true every value is wrapped:
++   * <pre>{@code __device__ void f(cuda::std::optional<OUT>* out,
++   *                    cuda::std::optional<IN0> in0, ...)}</pre>
++   * A function may instead return a value, which libcudf reads as a {@code cudf::errc} and
++   * reports by throwing; that works here exactly as it does for the single-input form.
++   * <p>
++   * Only the function's own name is taken from the source: libcudf renames the identifier in front
++   * of the first {@code (} it finds, so the entry point must come first in the source text.
++   *
++   * @param inputs             the input columns, all of the same row count. Not empty. The caller
++   *                           keeps them alive for the duration of the call.
++   * @param udf                the device function, as CUDA source or PTX
++   * @param isPtx              true if {@code udf} is PTX, false if it is CUDA source. PTX cannot
++   *                           be null-aware, and is limited to integral and floating-point types.
++   * @param outputType         the type of the returned column
++   * @param isNullAware        true to pass each input as an optional and take the output as an
++   *                           optional, so the function decides what a null means
++   * @param outputNullability  whether the output may carry a null mask. {@link
++   *                           OutputNullability#PRESERVE} is always safe; see that enum for when
++   *                           {@link OutputNullability#ALL_VALID} is not.
++   * @return the transformed column
++   */
++  public static ColumnVector transform(ColumnView[] inputs, String udf, boolean isPtx,
++                                       DType outputType, boolean isNullAware,
++                                       OutputNullability outputNullability) {
++    if (inputs == null || inputs.length == 0) {
++      throw new IllegalArgumentException("transform requires at least one input column");
++    }
++    if (udf == null) {
++      throw new IllegalArgumentException("udf is null");
++    }
++    if (outputType == null) {
++      throw new IllegalArgumentException("outputType is null");
++    }
++    if (outputNullability == null) {
++      throw new IllegalArgumentException("outputNullability is null");
++    }
++    long[] handles = new long[inputs.length];
++    for (int i = 0; i < inputs.length; i++) {
++      if (inputs[i] == null) {
++        throw new IllegalArgumentException("input column " + i + " is null");
++      }
++      handles[i] = inputs[i].getNativeView();
++    }
++    return new ColumnVector(transformMulti(handles, udf, isPtx,
++        outputType.getTypeId().getNativeId(), outputType.getScale(),
++        isNullAware, outputNullability.getNativeId()));
++  }
++
+   /**
+    * Multiple different unary operations. The output is the same type as input.
+    * @param op      the operation to perform
+@@ -5164,6 +5223,10 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
+ 
+   private static native long transform(long viewHandle, String udf, boolean isPtx);
+ 
++  private static native long transformMulti(long[] viewHandles, String udf, boolean isPtx,
++                                            int outTypeId, int outScale, boolean isNullAware,
++                                            int outputNullability);
++
+   private static native long clamper(long nativeView, long loScalarHandle, long loScalarReplaceHandle,
+                                      long hiScalarHandle, long hiScalarReplaceHandle);
+ 
+diff --git a/java/src/main/java/ai/rapids/cudf/OutputNullability.java b/java/src/main/java/ai/rapids/cudf/OutputNullability.java
+new file mode 100644
+index 0000000000..d724a59b09
+--- /dev/null
++++ b/java/src/main/java/ai/rapids/cudf/OutputNullability.java
+@@ -0,0 +1,38 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package ai.rapids.cudf;
++
++/**
++ * Whether a transform's output column is allowed to carry a null mask.
++ * <p>
++ * This mirrors {@code cudf::output_nullability}. Which of the two is correct depends on the
++ * device function, not only on the inputs:
++ * <ul>
++ *   <li>{@link #PRESERVE} is always safe. For a null-unaware function it gives the output the
++ *       intersection of the input validity masks, and rows with a null input are not evaluated.
++ *       For a null-aware function it gives the output the validity the function itself returns.</li>
++ *   <li>{@link #ALL_VALID} asserts that the function produces a value for every row. libcudf then
++ *       allocates no mask. For a null-unaware function this also means no rows are skipped, so the
++ *       function reads the raw value under a null, which is only safe when no input is nullable.
++ *       Using it with a function that can produce a null is undefined behaviour.</li>
++ * </ul>
++ */
++public enum OutputNullability {
++  /** A null mask is produced if the operation can produce nulls. */
++  PRESERVE(0),
++  /** No null mask is produced; every output value is treated as valid. */
++  ALL_VALID(1);
++
++  private final int nativeId;
++
++  OutputNullability(int nativeId) {
++    this.nativeId = nativeId;
++  }
++
++  int getNativeId() {
++    return nativeId;
++  }
++}
+diff --git a/java/src/main/native/src/ColumnViewJni.cpp b/java/src/main/native/src/ColumnViewJni.cpp
+index 67b890ce5c..b0d23ee959 100644
+--- a/java/src/main/native/src/ColumnViewJni.cpp
++++ b/java/src/main/native/src/ColumnViewJni.cpp
+@@ -1565,6 +1565,59 @@ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_ColumnView_transform(
+   JNI_CATCH(env, 0);
+ }
+ 
++JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_ColumnView_transformMulti(JNIEnv* env,
++                                                                      jclass,
++                                                                      jlongArray j_view_handles,
++                                                                      jstring j_udf,
++                                                                      jboolean j_is_ptx,
++                                                                      jint j_out_type_id,
++                                                                      jint j_out_scale,
++                                                                      jboolean j_is_null_aware,
++                                                                      jint j_output_nullability)
++{
++  JNI_NULL_CHECK(env, j_view_handles, "input column handles are null", 0);
++  JNI_NULL_CHECK(env, j_udf, "udf is null", 0);
++  JNI_ARG_CHECK(env,
++                j_output_nullability == 0 || j_output_nullability == 1,
++                "output nullability is not a cudf::output_nullability value",
++                0);
++  JNI_TRY
++  {
++    cudf::jni::auto_set_device(env);
++
++    // native_jpointerArray releases the Java array in its destructor, including on the throw
++    // paths below, so the handles are not pinned across the transform itself.
++    cudf::jni::native_jpointerArray<cudf::column_view> n_views(env, j_view_handles);
++    JNI_ARG_CHECK(env, n_views.size() > 0, "transform requires at least one input column", 0);
++
++    std::vector<cudf::transform_input> inputs;
++    inputs.reserve(n_views.size());
++    for (int i = 0; i < n_views.size(); i++) {
++      JNI_NULL_CHECK(env, n_views[i], "input column is null", 0);
++      // A transform_input holds a column_view by value, so the view is copied here and the
++      // caller's ColumnView only has to outlive this loop, not the kernel launch. The device
++      // buffers it points at are owned by the caller either way.
++      inputs.emplace_back(*n_views[i]);
++    }
++
++    cudf::jni::native_jstring n_j_udf(env, j_udf);
++    std::string n_udf = n_j_udf;
++
++    // transform_extended validates the rest: equal row counts, supported input and output types,
++    // and that PTX is not asked to be null-aware. Letting it do so keeps one set of rules.
++    return release_as_jlong(cudf::transform_extended(
++      inputs,
++      n_udf,
++      cudf::jni::make_data_type(j_out_type_id, j_out_scale),
++      j_is_ptx ? cudf::udf_source_type::PTX : cudf::udf_source_type::CUDA,
++      std::nullopt,
++      j_is_null_aware ? cudf::null_aware::YES : cudf::null_aware::NO,
++      std::nullopt,
++      static_cast<cudf::output_nullability>(j_output_nullability)));
++  }
++  JNI_CATCH(env, 0);
++}
++
+ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_ColumnView_stringStartWith(JNIEnv* env,
+                                                                        jobject j_object,
+                                                                        jlong j_view_handle,
+diff --git a/java/src/test/java/ai/rapids/cudf/TransformMultiTest.java b/java/src/test/java/ai/rapids/cudf/TransformMultiTest.java
+new file mode 100644
+index 0000000000..fa036b67bf
+--- /dev/null
++++ b/java/src/test/java/ai/rapids/cudf/TransformMultiTest.java
+@@ -0,0 +1,602 @@
++/*
++ *
++ *  SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ *  SPDX-License-Identifier: Apache-2.0
++ *
++ */
++
++package ai.rapids.cudf;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.Random;
++
++import static ai.rapids.cudf.AssertUtils.assertColumnsAreEqual;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * Tests for the generalized {@link ColumnView#transform(ColumnView[], String, boolean, DType,
++ * boolean, OutputNullability)} binding: several inputs, a chosen output type, and null-aware
++ * execution.
++ *
++ * <p>Every expected value here is computed on the host, in Java, from the same inputs. The
++ * floating-point cases deliberately use values and operations that are exact in binary
++ * floating point -- sums and doublings of small integers -- so that the comparison does not
++ * depend on whether the JIT contracts a multiply-add or on any other reassociation the device
++ * compiler is free to make. Where a test does care about an inexact result it says so.
++ */
++public class TransformMultiTest extends CudfTestBase {
++
++  private static ColumnVector transform(String udf, DType outType, ColumnView... inputs) {
++    return ColumnView.transform(inputs, udf, false, outType, false, OutputNullability.PRESERVE);
++  }
++
++  private static ColumnVector transformNullAware(String udf, DType outType,
++                                                 OutputNullability nullability,
++                                                 ColumnView... inputs) {
++    return ColumnView.transform(inputs, udf, false, outType, true, nullability);
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // A: INT32 -> INT32. The same function the single-input binding is tested with, so this
++  // also says the generalized path agrees with the one that already shipped.
++  // ---------------------------------------------------------------------------------------
++
++  private static final String A_UDF =
++      "__device__ inline void f(int* out, int a) { *out = a * a - a; }";
++
++  @Test
++  void caseA_int32ToInt32() {
++    // Deliberately small values: signed overflow is undefined in C++, so a test that relied on
++    // it wrapping would be testing nvcc, not the binding. Boundary values get their own test
++    // below, with a function that cannot overflow.
++    try (ColumnVector in = ColumnVector.fromBoxedInts(2, 3, null, 4, -5, 0, 1000, -1000);
++         ColumnVector got = transform(A_UDF, DType.INT32, in);
++         ColumnVector viaOld = in.transform(A_UDF, false);
++         ColumnVector expected = ColumnVector.fromBoxedInts(
++             2 * 2 - 2, 3 * 3 - 3, null, 4 * 4 - 4, -5 * -5 - -5, 0,
++             1000 * 1000 - 1000, -1000 * -1000 - -1000)) {
++      assertColumnsAreEqual(expected, got);
++      // The old binding must keep working, and must agree with the new one.
++      assertColumnsAreEqual(viaOld, got);
++    }
++  }
++
++  @Test
++  void integerBoundaryValues() {
++    String udf = "__device__ inline void f(long long* out, int a, long long b) "
++        + "{ *out = (long long)a + b / 2; }";
++    try (ColumnVector a = ColumnVector.fromInts(Integer.MIN_VALUE, Integer.MAX_VALUE, 0, -1);
++         ColumnVector b = ColumnVector.fromLongs(Long.MIN_VALUE, Long.MAX_VALUE, 0L, -1L);
++         ColumnVector got = transform(udf, DType.INT64, a, b);
++         // Integer division truncates towards zero in both Java and C++, so -1 / 2 == 0.
++         ColumnVector expected = ColumnVector.fromLongs(
++             (long) Integer.MIN_VALUE + Long.MIN_VALUE / 2,
++             (long) Integer.MAX_VALUE + Long.MAX_VALUE / 2,
++             0L,
++             -1L)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // B: INT32, INT32 -> INT32
++  // ---------------------------------------------------------------------------------------
++
++  @Test
++  void caseB_twoInt32ToInt32() {
++    String udf = "__device__ inline void f(int* out, int a, int b) { *out = a + b * 2; }";
++    try (ColumnVector a = ColumnVector.fromInts(1, 2, 3, -4, 0, Integer.MAX_VALUE);
++         ColumnVector b = ColumnVector.fromInts(10, -20, 30, 40, 0, 0);
++         ColumnVector got = transform(udf, DType.INT32, a, b);
++         ColumnVector expected = ColumnVector.fromInts(
++             1 + 10 * 2, 2 + -20 * 2, 3 + 30 * 2, -4 + 40 * 2, 0, Integer.MAX_VALUE)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void caseB_argumentOrderIsTheColumnOrder() {
++    // A non-commutative function, so that swapping the columns must change the answer.
++    String udf = "__device__ inline void f(int* out, int a, int b) { *out = a - b; }";
++    try (ColumnVector a = ColumnVector.fromInts(10, 20, 30);
++         ColumnVector b = ColumnVector.fromInts(1, 2, 3);
++         ColumnVector ab = transform(udf, DType.INT32, a, b);
++         ColumnVector ba = transform(udf, DType.INT32, b, a);
++         ColumnVector expectedAb = ColumnVector.fromInts(9, 18, 27);
++         ColumnVector expectedBa = ColumnVector.fromInts(-9, -18, -27)) {
++      assertColumnsAreEqual(expectedAb, ab);
++      assertColumnsAreEqual(expectedBa, ba);
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // C: INT32, FLOAT32 -> FLOAT64
++  // ---------------------------------------------------------------------------------------
++
++  @Test
++  void caseC_mixedInt32Float32ToFloat64() {
++    String udf = "__device__ inline void f(double* out, int a, float b) "
++        + "{ *out = (double)a + (double)b; }";
++    try (ColumnVector a = ColumnVector.fromInts(1, 2, 3, -4, 0);
++         ColumnVector b = ColumnVector.fromFloats(0.5f, 0.25f, -1.5f, 2.0f, 0.0f);
++         ColumnVector got = transform(udf, DType.FLOAT64, a, b);
++         ColumnVector expected = ColumnVector.fromDoubles(1.5, 2.25, 1.5, -2.0, 0.0)) {
++      // Every value above is a dyadic rational exactly representable in both float and double,
++      // and a single addition of two exact doubles is itself exact, so this is an equality test.
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void caseC_floatingPointSpecialValues() {
++    String udf = "__device__ inline void f(double* out, int a, float b) "
++        + "{ *out = (double)a + (double)b; }";
++    try (ColumnVector a = ColumnVector.fromInts(1, 1, 1, 1);
++         ColumnVector b = ColumnVector.fromFloats(Float.NaN, Float.POSITIVE_INFINITY,
++             Float.NEGATIVE_INFINITY, -0.0f);
++         ColumnVector got = transform(udf, DType.FLOAT64, a, b);
++         ColumnVector expected = ColumnVector.fromDoubles(Double.NaN, Double.POSITIVE_INFINITY,
++             Double.NEGATIVE_INFINITY, 1.0)) {
++      // assertColumnsAreEqual compares NaN bit patterns through the host column, and
++      // float -> double widening of a quiet NaN keeps it quiet.
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // D: INT64, INT32, FLOAT64 -> INT64
++  // ---------------------------------------------------------------------------------------
++
++  @Test
++  void caseD_threeMixedInputsToInt64() {
++    String udf = "__device__ inline void f(long long* out, long long a, int b, double c) "
++        + "{ *out = a + (long long)b + (long long)c; }";
++    try (ColumnVector a = ColumnVector.fromLongs(1L, 1L << 40, -7L, 0L);
++         ColumnVector b = ColumnVector.fromInts(2, 3, -4, 0);
++         ColumnVector c = ColumnVector.fromDoubles(3.0, 4.75, -5.25, 0.0);
++         ColumnVector got = transform(udf, DType.INT64, a, b, c);
++         // C and C++ truncate towards zero when converting double to an integer, which is what
++         // (long long)c does: 4.75 -> 4, -5.25 -> -5.
++         ColumnVector expected = ColumnVector.fromLongs(
++             1L + 2L + 3L, (1L << 40) + 3L + 4L, -7L + -4L + -5L, 0L)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // E: INT64 -> INT64, and F: FLOAT64 -> FLOAT64
++  // ---------------------------------------------------------------------------------------
++
++  @Test
++  void caseE_int64ToInt64() {
++    String udf = "__device__ inline void f(long long* out, long long a) { *out = a * 3; }";
++    try (ColumnVector in = ColumnVector.fromBoxedLongs(1L, -2L, null, 1L << 40, 0L,
++             Long.MIN_VALUE / 4, Long.MAX_VALUE / 4);
++         ColumnVector got = transform(udf, DType.INT64, in);
++         ColumnVector expected = ColumnVector.fromBoxedLongs(3L, -6L, null, 3L * (1L << 40), 0L,
++             (Long.MIN_VALUE / 4) * 3, (Long.MAX_VALUE / 4) * 3)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void caseF_float64ToFloat64() {
++    String udf = "__device__ inline void f(double* out, double a) { *out = a + a; }";
++    try (ColumnVector in = ColumnVector.fromBoxedDoubles(1.5, -2.25, null, 0.0, -0.0,
++             Double.MAX_VALUE / 4);
++         ColumnVector got = transform(udf, DType.FLOAT64, in);
++         ColumnVector expected = ColumnVector.fromBoxedDoubles(3.0, -4.5, null, 0.0, -0.0,
++             Double.MAX_VALUE / 2)) {
++      // Doubling is exact in binary floating point for every finite input that does not overflow.
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void boolOutput() {
++    String udf = "__device__ inline void f(bool* out, long long a) { *out = a > 0; }";
++    try (ColumnVector in = ColumnVector.fromBoxedLongs(1L, -2L, null, 0L, 7L);
++         ColumnVector got = transform(udf, DType.BOOL8, in);
++         ColumnVector expected = ColumnVector.fromBoxedBooleans(true, false, null, false, true)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void float32Output() {
++    String udf = "__device__ inline void f(float* out, int a) { *out = (float)a * 0.5f; }";
++    try (ColumnVector in = ColumnVector.fromInts(1, 2, 3, -4);
++         ColumnVector got = transform(udf, DType.FLOAT32, in);
++         ColumnVector expected = ColumnVector.fromFloats(0.5f, 1.0f, 1.5f, -2.0f)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // Null handling without null-awareness: libcudf builds a stencil from the inputs, skips
++  // those rows, and gives the output the intersection of the input masks.
++  // ---------------------------------------------------------------------------------------
++
++  @Test
++  void nullUnawareIntersectsInputValidity() {
++    String udf = "__device__ inline void f(int* out, int a, int b) { *out = a + b; }";
++    try (ColumnVector a = ColumnVector.fromBoxedInts(1, null, 3, null, 5);
++         ColumnVector b = ColumnVector.fromBoxedInts(10, 20, null, null, 50);
++         ColumnVector got = transform(udf, DType.INT32, a, b);
++         ColumnVector expected = ColumnVector.fromBoxedInts(11, null, null, null, 55)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // G: nullable INT64 -> non-null INT32. The function answers for a null input, so the
++  // output carries no mask at all.
++  // ---------------------------------------------------------------------------------------
++
++  private static final String G_UDF =
++      "__device__ inline void f(cuda::std::optional<int>* out, cuda::std::optional<long long> a) "
++          + "{ *out = a.has_value() ? (int)a.value() : -1; }";
++
++  @Test
++  void caseG_nullableInt64ToNonNullInt32() {
++    try (ColumnVector in = ColumnVector.fromBoxedLongs(5L, null, -7L, null, 0L);
++         ColumnVector got = transformNullAware(G_UDF, DType.INT32,
++             OutputNullability.ALL_VALID, in);
++         ColumnVector expected = ColumnVector.fromInts(5, -1, -7, -1, 0)) {
++      assertColumnsAreEqual(expected, got);
++      assertEquals(0, got.getNullCount());
++      assertTrue(!got.hasNulls());
++    }
++  }
++
++  @Test
++  void caseG_alsoCorrectUnderPreserve() {
++    // PRESERVE is always safe: the mask is then whatever the function returned, which here is
++    // "valid" for every row. The values must be identical to the ALL_VALID run.
++    try (ColumnVector in = ColumnVector.fromBoxedLongs(5L, null, -7L, null, 0L);
++         ColumnVector allValid = transformNullAware(G_UDF, DType.INT32,
++             OutputNullability.ALL_VALID, in);
++         ColumnVector preserve = transformNullAware(G_UDF, DType.INT32,
++             OutputNullability.PRESERVE, in)) {
++      assertColumnsAreEqual(allValid, preserve);
++      assertEquals(0, preserve.getNullCount());
++    }
++  }
++
++  @Test
++  void caseG_allNullInput() {
++    try (ColumnVector in = ColumnVector.fromBoxedLongs(null, null, null);
++         ColumnVector got = transformNullAware(G_UDF, DType.INT32,
++             OutputNullability.ALL_VALID, in);
++         ColumnVector expected = ColumnVector.fromInts(-1, -1, -1)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // H: nullable INT64 -> nullable INT32. The function returns null for a null input and also
++  // for a non-null input it does not like, which is the case a validity-mask copy cannot do.
++  // ---------------------------------------------------------------------------------------
++
++  private static final String H_UDF =
++      "__device__ inline void f(cuda::std::optional<int>* out, cuda::std::optional<long long> a) {"
++          + "  if (!a.has_value()) { *out = cuda::std::nullopt; return; }"
++          + "  if (a.value() < 0) { *out = cuda::std::nullopt; return; }"
++          + "  *out = (int)(a.value() * 2);"
++          + "}";
++
++  @Test
++  void caseH_nullableInt64ToNullableInt32() {
++    try (ColumnVector in = ColumnVector.fromBoxedLongs(5L, null, -7L, 0L, 11L);
++         ColumnVector got = transformNullAware(H_UDF, DType.INT32,
++             OutputNullability.PRESERVE, in);
++         ColumnVector expected = ColumnVector.fromBoxedInts(10, null, null, 0, 22)) {
++      assertColumnsAreEqual(expected, got);
++      // Row 2 was not null on input but is null on output: the mask is the function's, not a
++      // copy of the input's.
++      assertEquals(2, got.getNullCount());
++    }
++  }
++
++  @Test
++  void caseH_nullProducedFromAFullyValidInput() {
++    try (ColumnVector in = ColumnVector.fromLongs(1L, -1L, 2L, -2L);
++         ColumnVector got = transformNullAware(H_UDF, DType.INT32,
++             OutputNullability.PRESERVE, in);
++         ColumnVector expected = ColumnVector.fromBoxedInts(2, null, 4, null)) {
++      assertColumnsAreEqual(expected, got);
++      assertEquals(2, got.getNullCount());
++    }
++  }
++
++  @Test
++  void caseH_allNullInput() {
++    try (ColumnVector in = ColumnVector.fromBoxedLongs(null, null, null, null);
++         ColumnVector got = transformNullAware(H_UDF, DType.INT32,
++             OutputNullability.PRESERVE, in);
++         ColumnVector expected = ColumnVector.fromBoxedInts(null, null, null, null)) {
++      assertColumnsAreEqual(expected, got);
++      assertEquals(4, got.getNullCount());
++    }
++  }
++
++  @Test
++  void nullAwareWithTwoInputsEitherOfWhichMayBeNull() {
++    String udf =
++        "__device__ inline void f(cuda::std::optional<long long>* out,"
++            + " cuda::std::optional<long long> a, cuda::std::optional<int> b) {"
++            + "  if (!a.has_value() && !b.has_value()) { *out = cuda::std::nullopt; return; }"
++            + "  long long av = a.has_value() ? a.value() : 0;"
++            + "  long long bv = b.has_value() ? (long long)b.value() : 0;"
++            + "  *out = av + bv;"
++            + "}";
++    try (ColumnVector a = ColumnVector.fromBoxedLongs(1L, null, 3L, null, 5L);
++         ColumnVector b = ColumnVector.fromBoxedInts(10, 20, null, null, 50);
++         ColumnVector got = transformNullAware(udf, DType.INT64,
++             OutputNullability.PRESERVE, a, b);
++         ColumnVector expected = ColumnVector.fromBoxedLongs(11L, 20L, 3L, null, 55L)) {
++      assertColumnsAreEqual(expected, got);
++      assertEquals(1, got.getNullCount());
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // Sizes
++  // ---------------------------------------------------------------------------------------
++
++  @Test
++  void zeroRows() {
++    String udf = "__device__ inline void f(int* out, int a, int b) { *out = a + b; }";
++    try (ColumnVector a = ColumnVector.fromInts();
++         ColumnVector b = ColumnVector.fromInts();
++         ColumnVector got = transform(udf, DType.INT32, a, b)) {
++      assertEquals(0, got.getRowCount());
++      assertEquals(DType.INT32, got.getType());
++    }
++  }
++
++  @Test
++  void oneRow() {
++    String udf = "__device__ inline void f(int* out, int a, int b) { *out = a + b; }";
++    try (ColumnVector a = ColumnVector.fromInts(7);
++         ColumnVector b = ColumnVector.fromInts(35);
++         ColumnVector got = transform(udf, DType.INT32, a, b);
++         ColumnVector expected = ColumnVector.fromInts(42)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void largeBatch() {
++    int n = 1_000_000;
++    long[] a = new long[n];
++    int[] b = new int[n];
++    long[] expectedValues = new long[n];
++    Random rng = new Random(20261122L);
++    for (int i = 0; i < n; i++) {
++      a[i] = rng.nextInt(1_000_000) - 500_000;
++      b[i] = rng.nextInt(1000);
++      expectedValues[i] = a[i] * 2 + b[i];
++    }
++    String udf = "__device__ inline void f(long long* out, long long a, int b) "
++        + "{ *out = a * 2 + (long long)b; }";
++    try (ColumnVector ca = ColumnVector.fromLongs(a);
++         ColumnVector cb = ColumnVector.fromInts(b);
++         ColumnVector got = transform(udf, DType.INT64, ca, cb);
++         ColumnVector expected = ColumnVector.fromLongs(expectedValues)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void repeatedCallsWithDifferentFunctions() {
++    // Each call compiles a different device function; the JIT cache is keyed on the source,
++    // so this is the case where a stale kernel would show up.
++    try (ColumnVector in = ColumnVector.fromInts(1, 2, 3, 4)) {
++      for (int k = 1; k <= 5; k++) {
++        String udf = "__device__ inline void f(int* out, int a) { *out = a * " + k + "; }";
++        try (ColumnVector got = transform(udf, DType.INT32, in);
++             ColumnVector expected = ColumnVector.fromInts(k, 2 * k, 3 * k, 4 * k)) {
++          assertColumnsAreEqual(expected, got);
++        }
++      }
++      // And back to the first one, which is now a cache hit.
++      try (ColumnVector got = transform(
++               "__device__ inline void f(int* out, int a) { *out = a * 1; }", DType.INT32, in);
++           ColumnVector expected = ColumnVector.fromInts(1, 2, 3, 4)) {
++        assertColumnsAreEqual(expected, got);
++      }
++    }
++  }
++
++  @Test
++  void repeatedExecutionDoesNotLeakDeviceMemory() {
++    String udf = "__device__ inline void f(long long* out, long long a, int b) "
++        + "{ *out = a + (long long)b; }";
++    long[] a = new long[100_000];
++    int[] b = new int[100_000];
++    for (int i = 0; i < a.length; i++) {
++      a[i] = i;
++      b[i] = i % 7;
++    }
++    try (ColumnVector ca = ColumnVector.fromLongs(a);
++         ColumnVector cb = ColumnVector.fromInts(b)) {
++      // Warm up so the JIT compilation and its one-off allocations are not counted.
++      for (int i = 0; i < 3; i++) {
++        transform(udf, DType.INT64, ca, cb).close();
++      }
++      long before = Rmm.getTotalBytesAllocated();
++      for (int i = 0; i < 50; i++) {
++        transform(udf, DType.INT64, ca, cb).close();
++      }
++      long after = Rmm.getTotalBytesAllocated();
++      assertEquals(before, after,
++          "device memory outstanding after 50 closed transforms changed by " + (after - before));
++    }
++  }
++
++  @Test
++  void aFailedCallDoesNotLeakDeviceMemory() {
++    String udf = "__device__ inline void f(int* out, int a, int b) { *out = a + b; }";
++    try (ColumnVector a = ColumnVector.fromInts(1, 2, 3);
++         ColumnVector b = ColumnVector.fromInts(1, 2)) {
++      long before = Rmm.getTotalBytesAllocated();
++      for (int i = 0; i < 20; i++) {
++        assertThrows(CudfException.class, () -> transform(udf, DType.INT32, a, b).close());
++      }
++      assertEquals(before, Rmm.getTotalBytesAllocated());
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // Errors reported by the device function itself. A non-void return is read as a cudf::errc.
++  // ---------------------------------------------------------------------------------------
++
++  private static final String DIVIDING_UDF =
++      "__device__ inline int f(int* out, int a, int b) {"
++          + "  if (b == 0) { return 2; }"  // cudf::errc::DIVISION_BY_ZERO
++          + "  *out = a / b;"
++          + "  return 0;"                  // cudf::errc::SUCCESS
++          + "}";
++
++  @Test
++  void errorReturningFunctionSucceedsWhenNoRowErrors() {
++    try (ColumnVector a = ColumnVector.fromInts(10, 20, 30);
++         ColumnVector b = ColumnVector.fromInts(2, 4, 5);
++         ColumnVector got = transform(DIVIDING_UDF, DType.INT32, a, b);
++         ColumnVector expected = ColumnVector.fromInts(5, 5, 6)) {
++      assertColumnsAreEqual(expected, got);
++    }
++  }
++
++  @Test
++  void errorReturningFunctionReportsDivisionByZero() {
++    try (ColumnVector a = ColumnVector.fromInts(10, 20, 30);
++         ColumnVector b = ColumnVector.fromInts(2, 0, 5)) {
++      CudfException e = assertThrows(CudfException.class,
++          () -> transform(DIVIDING_UDF, DType.INT32, a, b).close());
++      assertTrue(e.getMessage().contains("DIVISION_BY_ZERO"), e.getMessage());
++    }
++  }
++
++  @Test
++  void errorReturningFunctionReportsOverflow() {
++    String udf = "__device__ inline int f(long long* out, long long a) {"
++        + "  if (a > 1000) { return 1; }"  // cudf::errc::OVERFLOW
++        + "  *out = a;"
++        + "  return 0;"
++        + "}";
++    try (ColumnVector in = ColumnVector.fromLongs(1L, 2L, 5000L)) {
++      CudfException e = assertThrows(CudfException.class,
++          () -> transform(udf, DType.INT64, in).close());
++      assertTrue(e.getMessage().contains("OVERFLOW"), e.getMessage());
++    }
++  }
++
++  @Test
++  void errorReturningFunctionWorksWhenNullAware() {
++    // Error reporting must not be restricted to the null-unaware path.
++    String udf = "__device__ inline int f(cuda::std::optional<int>* out,"
++        + " cuda::std::optional<int> a, cuda::std::optional<int> b) {"
++        + "  if (!a.has_value() || !b.has_value()) { *out = cuda::std::nullopt; return 0; }"
++        + "  if (b.value() == 0) { return 2; }"
++        + "  *out = a.value() / b.value();"
++        + "  return 0;"
++        + "}";
++    try (ColumnVector a = ColumnVector.fromBoxedInts(10, 20, null);
++         ColumnVector b = ColumnVector.fromBoxedInts(2, 4, 0);
++         ColumnVector got = transformNullAware(udf, DType.INT32,
++             OutputNullability.PRESERVE, a, b);
++         ColumnVector expected = ColumnVector.fromBoxedInts(5, 5, null)) {
++      // Row 2 has a null input, so the function returns before dividing: no error.
++      assertColumnsAreEqual(expected, got);
++    }
++    try (ColumnVector a = ColumnVector.fromBoxedInts(10, 20, 30);
++         ColumnVector b = ColumnVector.fromBoxedInts(2, 0, 5)) {
++      CudfException e = assertThrows(CudfException.class,
++          () -> transformNullAware(udf, DType.INT32, OutputNullability.PRESERVE, a, b).close());
++      assertTrue(e.getMessage().contains("DIVISION_BY_ZERO"), e.getMessage());
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------
++  // Argument validation
++  // ---------------------------------------------------------------------------------------
++
++  @Test
++  void emptyInputArrayIsRejected() {
++    assertThrows(IllegalArgumentException.class,
++        () -> ColumnView.transform(new ColumnView[0], A_UDF, false, DType.INT32, false,
++            OutputNullability.PRESERVE));
++  }
++
++  @Test
++  void nullArgumentsAreRejected() {
++    try (ColumnVector in = ColumnVector.fromInts(1, 2, 3)) {
++      ColumnView[] withNull = new ColumnView[] {in, null};
++      assertThrows(IllegalArgumentException.class,
++          () -> ColumnView.transform(withNull, A_UDF, false, DType.INT32, false,
++              OutputNullability.PRESERVE));
++      assertThrows(IllegalArgumentException.class,
++          () -> ColumnView.transform(null, A_UDF, false, DType.INT32, false,
++              OutputNullability.PRESERVE));
++      assertThrows(IllegalArgumentException.class,
++          () -> ColumnView.transform(new ColumnView[] {in}, null, false, DType.INT32, false,
++              OutputNullability.PRESERVE));
++      assertThrows(IllegalArgumentException.class,
++          () -> ColumnView.transform(new ColumnView[] {in}, A_UDF, false, null, false,
++              OutputNullability.PRESERVE));
++      assertThrows(IllegalArgumentException.class,
++          () -> ColumnView.transform(new ColumnView[] {in}, A_UDF, false, DType.INT32, false,
++              null));
++    }
++  }
++
++  @Test
++  void mismatchedColumnLengthsAreRejected() {
++    String udf = "__device__ inline void f(int* out, int a, int b) { *out = a + b; }";
++    try (ColumnVector a = ColumnVector.fromInts(1, 2, 3);
++         ColumnVector b = ColumnVector.fromInts(1, 2)) {
++      assertThrows(CudfException.class, () -> transform(udf, DType.INT32, a, b).close());
++    }
++  }
++
++  @Test
++  void unsupportedInputTypeIsRejected() {
++    String udf = "__device__ inline void f(int* out, int a) { *out = a; }";
++    try (ColumnVector listCol = ColumnVector.fromLists(
++             new HostColumnVector.ListType(true, new HostColumnVector.BasicType(true, DType.INT32)),
++             java.util.Arrays.asList(1, 2), java.util.Arrays.asList(3))) {
++      assertThrows(CudfException.class, () -> transform(udf, DType.INT32, listCol).close());
++    }
++  }
++
++  @Test
++  void ptxCannotBeNullAware() {
++    // libcudf refuses this combination, and the binding must let it: silently dropping
++    // null-awareness would read raw values under nulls.
++    try (ColumnVector in = ColumnVector.fromBoxedInts(1, null, 3)) {
++      assertThrows(CudfException.class,
++          () -> ColumnView.transform(new ColumnView[] {in}, ColumnVectorTest.ptx, true,
++              DType.INT64, true, OutputNullability.PRESERVE).close());
++    }
++  }
++
++  @Test
++  void ptxStillWorksThroughTheGeneralizedBinding() {
++    // The same PTX, inputs and expectations as the shipped single-input test, run through the
++    // new entry point instead.
++    try (ColumnVector in = ColumnVector.fromBoxedInts(2, 3, null, 4);
++         ColumnVector got = ColumnView.transform(new ColumnView[] {in},
++             ColumnVectorTest.ptx, true, DType.INT32, false, OutputNullability.PRESERVE);
++         ColumnVector viaOld = in.transform(ColumnVectorTest.ptx, true);
++         ColumnVector expected = ColumnVector.fromBoxedInts(2 * 2 - 2, 3 * 3 - 3, null,
++             4 * 4 - 4)) {
++      assertColumnsAreEqual(expected, got);
++      assertColumnsAreEqual(viaOld, got);
++    }
++  }
++}

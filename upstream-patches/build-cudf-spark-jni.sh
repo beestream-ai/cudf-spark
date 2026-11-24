@@ -205,6 +205,17 @@ if [ ! -d "$WORKDIR/.git" ]; then
   git clone --filter=blob:none "$JNI_REPO" "$WORKDIR"
 fi
 cd "$WORKDIR"
+# Switching an existing checkout to another revision must not carry -- or lose -- anyone's edits.
+# The one tracked change this script makes itself is the version in pom.xml.
+if [ "$(git rev-parse HEAD)" != "$JNI_REVISION" ]; then
+  foreign=$(git status --porcelain --untracked-files=no --ignore-submodules=all | awk '$2 != "pom.xml"')
+  if [ -n "$foreign" ]; then
+    echo >&2 "REFUSING: $WORKDIR is not at $JNI_REVISION and has tracked changes this script did not make:"
+    echo >&2 "$foreign"
+    echo >&2 "Nothing was changed. Use a fresh work directory, or commit/stash those changes."
+    exit 1
+  fi
+fi
 git fetch origin "$JNI_REVISION"
 git checkout --detach "$JNI_REVISION"
 
@@ -219,49 +230,17 @@ if [ "$actual" != "$EXPECTED_CUDF_REVISION" ]; then
 fi
 echo "== cudf $actual (matches the released artifact)"
 
-# Leave the cuDF submodule as the patch machinery expects to find it: pristine.
-#
-# `build/unapply-patches` reverses a saved `git diff`, and a `git diff` never contains untracked
-# files -- so a patch that *adds* files cannot be fully reversed by it. Ours adds two
-# (OutputNullability.java, TransformMultiTest.java). After any interrupted or repeated build they
-# survive the un-patch step, and the next `apply-patches` stops with "already exists in working
-# directory". That makes `mvn clean` non-idempotent for any additive patch, this one included, so
-# the leftovers are cleared here before the build is allowed to start.
-#
-# Only the exact paths this patch creates are removed, read out of the patch itself rather than
-# written down, and each by its full name. Nothing else in the submodule is touched.
-reset_cudf_submodule() {
-  local sub="thirdparty/cudf"
-  git -C "$sub" diff --quiet && git -C "$sub" diff --cached --quiet \
-    && [ -z "$(git -C "$sub" ls-files --others --exclude-standard)" ] && return 0
-
-  echo "== the cuDF submodule carries changes from an earlier build; restoring it"
-  ./build/unapply-patches >/dev/null 2>&1 || true
-
-  # Files this patch creates: the `+++ b/<path>` line of each `new file mode` hunk.
-  local added
-  added=$(awk '/^new file mode/ { want = 1 } want && /^\+\+\+ b\// { sub(/^\+\+\+ b\//, ""); print; want = 0 }' "$PATCH")
-  local f
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    if [ -f "$sub/$f" ]; then
-      echo "   removing $f (added by the patch, left behind by the un-patch step)"
-      rm -f "$sub/$f"
-    fi
-  done <<< "$added"
-
-  [ -f "$sub/spark-rapids-jni.patch" ] && rm -f "$sub/spark-rapids-jni.patch"
-  git -C "$sub" checkout -- .
-
-  if ! git -C "$sub" diff --quiet || [ -n "$(git -C "$sub" ls-files --others --exclude-standard)" ]; then
-    echo >&2 "ERROR: the cuDF submodule is still not clean:"
-    git -C "$sub" status --short >&2
-    echo >&2 "       Clean it by hand, or re-clone the work directory, and run this again."
-    exit 1
-  fi
-  echo "   submodule restored to $(git -C "$sub" rev-parse --short HEAD)"
-}
-reset_cudf_submodule
+# Leave the cuDF submodule as the patch machinery expects to find it: pristine -- but only by
+# undoing what the build itself did. See cudf-submodule-state.sh: it restores exactly the paths the
+# staged patches account for, and refuses, changing nothing, if anything else has been edited.
+# (The previous version ended in `git checkout -- .`, which discarded unrelated tracked edits.)
+# shellcheck source=cudf-submodule-state.sh
+source "$HERE/cudf-submodule-state.sh"
+if ! restore_cudf_submodule thirdparty/cudf patches; then
+  echo >&2 "The work directory was left exactly as it was. Clean the cuDF submodule by hand, or pass"
+  echo >&2 "a fresh work directory as the first argument, and run this again."
+  exit 1
+fi
 
 # The build applies patches/*.patch to the cuDF submodule before compiling and reverses them on
 # `clean`, so dropping the patch in here is the supported way to carry a change: the submodule

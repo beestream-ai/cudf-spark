@@ -69,6 +69,10 @@ build_applies() {
 
 clean() { [ -z "$(git -C "$1/sub" status --porcelain --untracked-files=all)" ]; }
 
+# Every file of the submodule's working tree (not .git), with its content hash: a refusal must leave
+# this exactly as it found it.
+snapshot() { (cd "$1/sub" && find . -path ./.git -prune -o -type f -print0 | sort -z | xargs -0 sha256sum); }
+
 echo "--- a clean checkout is left alone"
 d=$(fixture clean)
 restore_cudf_submodule "$d/sub" "$d/patches" > /dev/null
@@ -173,6 +177,60 @@ before=$(git -C "$d/sub" status --porcelain --untracked-files=all)
 CHECK_ONLY=1 restore_cudf_submodule "$d/sub" "$d/patches" > /dev/null
 check "returns success" "[ $? = 0 ]"
 check "nothing changed" "[ \"\$(git -C $d/sub status --porcelain --untracked-files=all)\" = \"$before\" ]"
+
+echo "--- Codex: a hand-edited hunk in the saved patch, touching only allowed paths, is refused and kept"
+d=$(fixture edited-state)
+build_applies "$d"
+sed -i 's/transform(ColumnView\[\] ...)/transform(ColumnView[] ..., my own change)/' "$d/sub/spark-rapids-jni.patch"
+grep -q 'my own change' "$d/sub/spark-rapids-jni.patch" || echo "  (fixture did not edit the hunk)"
+before=$(snapshot "$d")
+restore_cudf_submodule "$d/sub" "$d/patches" 2> "$d/err" > /dev/null
+check "refuses" "[ $? = 1 ]"
+check "says the saved patch is not the build's" "grep -q 'not the diff the build' $d/err"
+check "every file, the saved patch included, is byte-identical" "[ \"\$(snapshot $d)\" = \"\$before\" ]"
+
+echo "--- a saved patch from another patch set, on an otherwise clean tree, is refused and kept"
+d=$(fixture foreign-state)
+printf 'diff --git a/java/ColumnView.java b/java/ColumnView.java\n--- a/java/ColumnView.java\n+++ b/java/ColumnView.java\n@@ -1 +1 @@\n-column view\n+someone else\n' > "$d/sub/spark-rapids-jni.patch"
+before=$(snapshot "$d")
+restore_cudf_submodule "$d/sub" "$d/patches" 2> /dev/null > /dev/null
+check "refuses" "[ $? = 1 ]"
+check "byte-identical" "[ \"\$(snapshot $d)\" = \"\$before\" ]"
+
+echo "--- a stale but genuine saved patch with only the first patch applied is the build's own"
+d=$(fixture stale-state)
+build_applies "$d"
+saved=$(cat "$d/sub/spark-rapids-jni.patch")
+git -C "$d/sub" apply -R "$d/patches/0002-generalized-jni.patch"
+printf '%s\n' "$saved" > "$d/sub/spark-rapids-jni.patch"
+restore_cudf_submodule "$d/sub" "$d/patches" > /dev/null
+check "returns success" "[ $? = 0 ]"
+check "restored to clean" "clean $d"
+
+echo "--- refusals leave every earlier fixture byte-identical"
+for kind in tracked patched created untracked; do
+  d=$(fixture "bytes-$kind")
+  build_applies "$d"
+  case $kind in
+    tracked) printf 'mine\n' >> "$d/sub/README.md" ;;
+    patched) printf 'mine\n' >> "$d/sub/java/ColumnView.java" ;;
+    created) printf 'mine\n' >> "$d/sub/java/OutputNullability.java" ;;
+    untracked) printf 'mine\n' > "$d/sub/java/Mine.java" ;;
+  esac
+  before=$(snapshot "$d")
+  restore_cudf_submodule "$d/sub" "$d/patches" 2> /dev/null > /dev/null
+  rc=$?
+  check "$kind: refuses and changes no byte" "[ $rc = 1 ] && [ \"\$(snapshot $d)\" = \"\$before\" ]"
+done
+
+echo "--- RESTORE_BACKUP_DIR keeps a copy of everything a justified restore removes"
+d=$(fixture backup)
+build_applies "$d"
+RESTORE_BACKUP_DIR="$d/backup" restore_cudf_submodule "$d/sub" "$d/patches" > /dev/null
+check "returns success" "[ $? = 0 ] && clean $d"
+check "the saved patch was backed up" "[ -s $d/backup/files/spark-rapids-jni.patch ]"
+check "a created file was backed up" "grep -q OutputNullability $d/backup/files/java/OutputNullability.java"
+check "the tracked diff was backed up" "grep -q 'static nvcomp' $d/backup/tracked.diff"
 
 echo
 echo "=== CHECKS: $((PASS + FAIL)), FAILURES: $FAIL ==="

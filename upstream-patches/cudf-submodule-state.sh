@@ -41,9 +41,16 @@
 #      compared through a temporary index so that nothing is written while checking. A file the
 #      patches create may also be left over on its own (the additive-patch case), but only with
 #      exactly the content the patch gives it.
-#   3. Only then are those named paths restored: tracked ones from HEAD, created ones removed.
+#   3. The saved state file, if present, must be exactly what apply-patches writes after applying
+#      every patch: `git diff` of the fully patched tree. That is compared by content -- its
+#      `git patch-id --stable` against the same diff rebuilt in a temporary index -- not by the
+#      paths it mentions. A state file whose hunks were edited by hand names the same paths and is
+#      someone's work; it is refused, not deleted.
+#   4. Only then are those named paths restored: tracked ones from HEAD, created ones removed. If
+#      RESTORE_BACKUP_DIR is set, every file about to be removed or overwritten is first copied
+#      there, so even a restore that was justified can be inspected afterwards.
 #
-#   If either check fails, nothing is changed and the caller is told to sort it out. A refusal is the
+#   If any check fails, nothing is changed and the caller is told to sort it out. A refusal is the
 #   correct result for a tree this script cannot account for; a reset is not.
 
 # restore_cudf_submodule <submodule-dir> <patch-dir>
@@ -135,12 +142,35 @@ restore_cudf_submodule() {
     break
   done
   if [ $matched -ge 0 ]; then
-    local full
+    local full full_ok=1
     full=$(mktemp)
     GIT_INDEX_FILE=$full git -C "$sub" read-tree HEAD
     for p in "${patches[@]}"; do
-      GIT_INDEX_FILE=$full git -C "$sub" apply --cached "$p" 2>/dev/null || true
+      GIT_INDEX_FILE=$full git -C "$sub" apply --cached "$p" 2>/dev/null || full_ok=0
     done
+    # 3. The state file is apply-patches' `git diff` of the fully patched tree: tracked paths only,
+    #    so a file a patch creates (untracked when it was written) is not in it.
+    if [ -e "$sub/$state_file" ]; then
+      local expected_id actual_id
+      if [ $full_ok != 1 ]; then
+        echo >&2 "REFUSING: the patches do not apply together, so $state_file cannot be shown to be the build's own; nothing was changed."
+        rm -f "$index" "$full"
+        return 1
+      fi
+      local excludes=()
+      while IFS= read -r path; do
+        [ -n "$path" ] && excludes+=(":(exclude)$path")
+      done <<< "$created"
+      expected_id=$(GIT_INDEX_FILE=$full git -C "$sub" diff --cached HEAD -- . "${excludes[@]}" | git -C "$sub" patch-id --stable | awk '{print $1}')
+      actual_id=$(git -C "$sub" patch-id --stable < "$sub/$state_file" | awk '{print $1}')
+      if [ "$expected_id" != "$actual_id" ]; then
+        echo >&2 "REFUSING: $state_file in the cuDF submodule is not the diff the build's patches produce"
+        echo >&2 "  (patch-id ${actual_id:-<none>}, expected ${expected_id:-<none>}): its hunks were edited, or it"
+        echo >&2 "  belongs to another patch set. It is somebody's work, and nothing was changed."
+        rm -f "$index" "$full"
+        return 1
+      fi
+    fi
     while IFS= read -r path; do
       [ -n "$path" ] || continue
       [ -e "$sub/$path" ] || continue
@@ -162,11 +192,23 @@ restore_cudf_submodule() {
     return 1
   fi
 
-  # 3. Restore exactly those paths.
+  # 4. Restore exactly those paths.
   echo "== the cuDF submodule carries the build's own patches ($matched of ${#patches[@]} applied); restoring only those paths"
   if [ "${CHECK_ONLY:-0}" = "1" ]; then
     echo "   CHECK_ONLY=1: verified, nothing changed"
     return 0
+  fi
+  if [ -n "${RESTORE_BACKUP_DIR:-}" ]; then
+    mkdir -p "$RESTORE_BACKUP_DIR" || { echo >&2 "REFUSING: cannot create $RESTORE_BACKUP_DIR; nothing was changed"; return 1; }
+    git -C "$sub" diff > "$RESTORE_BACKUP_DIR/tracked.diff"
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      if [ -e "$sub/$path" ]; then
+        mkdir -p "$RESTORE_BACKUP_DIR/files/$(dirname "$path")"
+        cp -p -- "$sub/$path" "$RESTORE_BACKUP_DIR/files/$path"
+      fi
+    done <<< "$(printf '%s\n%s\n' "$touched" "$state_file")"
+    echo "   backed up what is about to change in $RESTORE_BACKUP_DIR"
   fi
   local restore=()
   while IFS= read -r path; do

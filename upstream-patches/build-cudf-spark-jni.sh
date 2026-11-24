@@ -102,7 +102,9 @@ CPP_PARALLEL_LEVEL=${CPP_PARALLEL_LEVEL:-8}
 CUDA_VERSION=${CUDA_VERSION:-12.9.1}
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PATCH="$HERE/cudf-transform-generalized-jni.patch"
+# TCUDF_PATCH exists for the fixture test (test-build-cudf-spark-jni.sh), which runs this script
+# against throwaway repositories; a real build uses the canonical patch next to this script.
+PATCH="${TCUDF_PATCH:-$HERE/cudf-transform-generalized-jni.patch}"
 WORKDIR=${1:-${WORKDIR:-$HOME/Projects/cudf-spark-jni}}
 
 [ -f "$PATCH" ] || { echo "patch not found: $PATCH" >&2; exit 1; }
@@ -234,8 +236,20 @@ echo "== cudf $actual (matches the released artifact)"
 # undoing what the build itself did. See cudf-submodule-state.sh: it restores exactly the paths the
 # staged patches account for, and refuses, changing nothing, if anything else has been edited.
 # (The previous version ended in `git checkout -- .`, which discarded unrelated tracked edits.)
+# The patch is staged under a fixed name. If something is already there under that name and it is
+# not byte-for-byte the canonical patch, it is somebody's edited copy: refuse before touching
+# anything, rather than restore the submodule against it or overwrite it.
+STAGED=patches/0002-tornadovm-transform-generalized-jni.patch
+if [ -e "$STAGED" ] && ! cmp -s "$PATCH" "$STAGED"; then
+  echo >&2 "REFUSING: $WORKDIR/$STAGED differs from the canonical $PATCH."
+  echo >&2 "  It may hold someone's changes to the binding; nothing was changed. Move it aside, or copy"
+  echo >&2 "  it over the canonical patch if it is meant to replace it, and run this again."
+  exit 1
+fi
+
 # shellcheck source=cudf-submodule-state.sh
 source "$HERE/cudf-submodule-state.sh"
+export RESTORE_BACKUP_DIR=${RESTORE_BACKUP_DIR:-$WORKDIR/.tcudf/restore-backups/$(date +%Y%m%d-%H%M%S)}
 if ! restore_cudf_submodule thirdparty/cudf patches; then
   echo >&2 "The work directory was left exactly as it was. Clean the cuDF submodule by hand, or pass"
   echo >&2 "a fresh work directory as the first argument, and run this again."
@@ -246,8 +260,12 @@ fi
 # `clean`, so dropping the patch in here is the supported way to carry a change: the submodule
 # itself stays at its pinned revision and is never edited in place.
 mkdir -p patches
-cp "$PATCH" patches/0002-tornadovm-transform-generalized-jni.patch
-echo "== patch staged as patches/0002-tornadovm-transform-generalized-jni.patch"
+if [ -e "$STAGED" ]; then
+  echo "== patch already staged as $STAGED (identical to the canonical patch)"
+else
+  cp "$PATCH" "$STAGED.part" && mv "$STAGED.part" "$STAGED"
+  echo "== patch staged as $STAGED"
+fi
 
 # A distinct version, so NVIDIA's released 26.08.0 in the local repository is never overwritten.
 if ! grep -q "<version>$JNI_VERSION</version>" pom.xml; then

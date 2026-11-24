@@ -290,7 +290,8 @@ echo "== building (arch $CMAKE_CUDA_ARCHITECTURES, $CPP_PARALLEL_LEVEL parallel 
   clean install
 
 echo
-echo "== installed com.nvidia:spark-rapids-jni:$JNI_VERSION:cuda12"
+# The Maven classifier follows the toolkit major version, the same way NVIDIA's build derives it.
+echo "== installed com.nvidia:spark-rapids-jni:$JNI_VERSION:cuda${CUDA_VERSION%%.*}"
 echo "   Point spark-jitudf at it with -Dcudf.jni.version=$JNI_VERSION, and put the jar ahead of"
 echo "   the RAPIDS distribution on the class path: both carry ai.rapids.cudf, and only this one"
 echo "   has the generalized ColumnView.transform."

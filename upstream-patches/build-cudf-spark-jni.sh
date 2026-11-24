@@ -240,6 +240,10 @@ echo "== cudf $actual (matches the released artifact)"
 # not byte-for-byte the canonical patch, it is somebody's edited copy: refuse before touching
 # anything, rather than restore the submodule against it or overwrite it.
 STAGED=patches/0002-tornadovm-transform-generalized-jni.patch
+if [ -L "$STAGED" ] || { [ -e "$STAGED" ] && [ ! -f "$STAGED" ]; } || [ -e "$STAGED.part" ] || [ -L "$STAGED.part" ]; then
+  echo >&2 "REFUSING: unexpected staging file at $STAGED or $STAGED.part; preserve it before rebuilding."
+  exit 1
+fi
 if [ -e "$STAGED" ] && ! cmp -s "$PATCH" "$STAGED"; then
   echo >&2 "REFUSING: $WORKDIR/$STAGED differs from the canonical $PATCH."
   echo >&2 "  It may hold someone's changes to the binding; nothing was changed. Move it aside, or copy"
@@ -263,7 +267,12 @@ mkdir -p patches
 if [ -e "$STAGED" ]; then
   echo "== patch already staged as $STAGED (identical to the canonical patch)"
 else
-  cp "$PATCH" "$STAGED.part" && mv "$STAGED.part" "$STAGED"
+  (
+    staged_copy=$(mktemp "$STAGED.XXXXXXXX")
+    trap 'rm -f -- "$staged_copy"' EXIT
+    cp --preserve=mode -- "$PATCH" "$staged_copy"
+    ln -T -- "$staged_copy" "$STAGED" # Atomically publish only if the destination is still absent.
+  )
   echo "== patch staged as $STAGED"
 fi
 

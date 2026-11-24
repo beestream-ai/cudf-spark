@@ -143,6 +143,15 @@ run_build "$w"
 check "refuses" "[ $? != 0 ] && grep -q 'differs from the canonical' $w.out"
 check "every byte is unchanged (staged patch, applied submodule, state file)" "[ \"\$(snapshot $w)\" = \"\$before\" ]"
 
+echo "--- an interrupted staging file is preserved"
+w=$(prepared stage-part)
+staged="$w/patches/0002-tornadovm-transform-generalized-jni.patch"
+mv -- "$staged" "$staged.part"
+printf 'local edit\n' >> "$staged.part"
+before=$(snapshot "$w")
+run_build "$w"
+check "refuses and preserves the interrupted patch" "[ $? != 0 ] && [ \"\$(snapshot $w)\" = \"$before\" ]"
+
 echo "--- a hand-edited hunk in the saved state file is refused, and nothing is touched"
 w=$(prepared state-edit)
 jni_build_applies "$w"

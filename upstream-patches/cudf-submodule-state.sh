@@ -43,7 +43,7 @@
 #      exactly the content the patch gives it.
 #   3. The saved state file, if present, must be exactly what apply-patches writes after applying
 #      every patch: `git diff` of the fully patched tree. That is compared by content -- its
-#      `git patch-id --stable` against the same diff rebuilt in a temporary index -- not by the
+#      full byte content against the same diff rebuilt in a temporary index -- not by the
 #      paths it mentions. A state file whose hunks were edited by hand names the same paths and is
 #      someone's work; it is refused, not deleted.
 #   4. Only then are those named paths restored: tracked ones from HEAD, created ones removed. If
@@ -63,6 +63,10 @@ restore_cudf_submodule() {
   patch_dir=$(cd "$2" && pwd) || { echo >&2 "REFUSING: patch directory $2 does not exist"; return 1; }
   local state_file="spark-rapids-jni.patch"
 
+  if [ -L "$sub/$state_file" ] || { [ -e "$sub/$state_file" ] && [ ! -f "$sub/$state_file" ]; }; then
+    echo >&2 "REFUSING: $sub/$state_file is not a regular build-generated file; nothing was changed."
+    return 1
+  fi
   if [ -z "$(git -C "$sub" status --porcelain --untracked-files=all)" ]; then
     return 0
   fi
@@ -151,7 +155,6 @@ restore_cudf_submodule() {
     # 3. The state file is apply-patches' `git diff` of the fully patched tree: tracked paths only,
     #    so a file a patch creates (untracked when it was written) is not in it.
     if [ -e "$sub/$state_file" ]; then
-      local expected_id actual_id
       if [ $full_ok != 1 ]; then
         echo >&2 "REFUSING: the patches do not apply together, so $state_file cannot be shown to be the build's own; nothing was changed."
         rm -f "$index" "$full"
@@ -161,15 +164,16 @@ restore_cudf_submodule() {
       while IFS= read -r path; do
         [ -n "$path" ] && excludes+=(":(exclude)$path")
       done <<< "$created"
-      expected_id=$(GIT_INDEX_FILE=$full git -C "$sub" diff --cached HEAD -- . "${excludes[@]}" | git -C "$sub" patch-id --stable | awk '{print $1}')
-      actual_id=$(git -C "$sub" patch-id --stable < "$sub/$state_file" | awk '{print $1}')
-      if [ "$expected_id" != "$actual_id" ]; then
+      local expected_diff
+      expected_diff=$(mktemp) || { rm -f "$index" "$full"; return 1; }
+      if ! GIT_INDEX_FILE=$full git -C "$sub" diff --cached HEAD -- . "${excludes[@]}" > "$expected_diff" ||
+         ! cmp -s -- "$expected_diff" "$sub/$state_file"; then
         echo >&2 "REFUSING: $state_file in the cuDF submodule is not the diff the build's patches produce"
-        echo >&2 "  (patch-id ${actual_id:-<none>}, expected ${expected_id:-<none>}): its hunks were edited, or it"
-        echo >&2 "  belongs to another patch set. It is somebody's work, and nothing was changed."
-        rm -f "$index" "$full"
+        echo >&2 "  Its contents differ. Preserve it before rebuilding. Nothing was changed."
+        rm -f "$index" "$full" "$expected_diff"
         return 1
       fi
+      rm -f "$expected_diff"
     fi
     while IFS= read -r path; do
       [ -n "$path" ] || continue

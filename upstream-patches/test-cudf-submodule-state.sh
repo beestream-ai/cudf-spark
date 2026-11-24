@@ -189,6 +189,15 @@ check "refuses" "[ $? = 1 ]"
 check "says the saved patch is not the build's" "grep -q 'not the diff the build' $d/err"
 check "every file, the saved patch included, is byte-identical" "[ \"\$(snapshot $d)\" = \"\$before\" ]"
 
+echo "--- patch-id ignores whitespace edits, which must also be preserved"
+d=$(fixture whitespace-state)
+build_applies "$d"
+sed -i 's/^+transform(/+transform (/' "$d/sub/spark-rapids-jni.patch"
+before=$(snapshot "$d")
+restore_cudf_submodule "$d/sub" "$d/patches" >/dev/null 2>&1
+rc=$?
+check "refuses whitespace edit and preserves every byte" "[ $rc = 1 ] && [ \"\$(snapshot $d)\" = \"$before\" ]"
+
 echo "--- a saved patch from another patch set, on an otherwise clean tree, is refused and kept"
 d=$(fixture foreign-state)
 printf 'diff --git a/java/ColumnView.java b/java/ColumnView.java\n--- a/java/ColumnView.java\n+++ b/java/ColumnView.java\n@@ -1 +1 @@\n-column view\n+someone else\n' > "$d/sub/spark-rapids-jni.patch"

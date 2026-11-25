@@ -207,8 +207,47 @@ if [ ! -d "$WORKDIR/.git" ]; then
   git clone --filter=blob:none "$JNI_REPO" "$WORKDIR"
 fi
 cd "$WORKDIR"
+
+# pom.xml is the one tracked file this script edits itself, and the only change it makes there is
+# the project version (see below). Before any rewrite or revision switch, pom.xml must be provably
+# either a revision's own file or that file with exactly this script's version edit. Anything else --
+# a different version, a dependency change, a reformatted file -- is somebody's work, and the script
+# refuses rather than overwrite it.
+POM_TMP=$(mktemp -d)
+trap 'rm -rf -- "$POM_TMP"' EXIT
+pom_versions() { # <rev>: writes <rev>'s pom.xml and the version-edited form; fails if the edit has no target
+  git show "$1:pom.xml" > "$POM_TMP/pristine" 2>/dev/null || return 1
+  perl -0pe "s{(<artifactId>spark-rapids-jni</artifactId>\s*\n\s*<version>)[^<]+(</version>)}{\${1}$JNI_VERSION\${2}}" \
+    "$POM_TMP/pristine" > "$POM_TMP/versioned" || return 1
+  ! cmp -s "$POM_TMP/pristine" "$POM_TMP/versioned"
+}
+pom_state() { # <rev>: pristine | versioned | other
+  if [ ! -f pom.xml ] || [ -L pom.xml ] || ! pom_versions "$1"; then
+    echo other
+  elif cmp -s pom.xml "$POM_TMP/pristine"; then
+    echo pristine
+  elif cmp -s pom.xml "$POM_TMP/versioned"; then
+    echo versioned
+  else
+    echo other
+  fi
+}
+refuse_pom() { # <rev>
+  echo >&2 "REFUSING: $WORKDIR/pom.xml has changes this script did not make."
+  echo >&2 "  It is neither $1's pom.xml nor that file with only the project version set to $JNI_VERSION."
+  if [ -f "$POM_TMP/pristine" ]; then
+    diff -u --label "$1:pom.xml" --label "pom.xml (work tree)" "$POM_TMP/pristine" pom.xml >&2 || true
+  fi
+  echo >&2 "Nothing was changed. Use a fresh work directory, or commit/stash/revert those edits, and run this again."
+  exit 1
+}
+# Write pom.xml atomically, replacing only content this script has just identified.
+install_pom() { # <file>
+  cp --preserve=mode -- "$1" pom.xml.tcudf-part
+  mv -f -- pom.xml.tcudf-part pom.xml
+}
+
 # Switching an existing checkout to another revision must not carry -- or lose -- anyone's edits.
-# The one tracked change this script makes itself is the version in pom.xml.
 if [ "$(git rev-parse HEAD)" != "$JNI_REVISION" ]; then
   foreign=$(git status --porcelain --untracked-files=no --ignore-submodules=all | awk '$2 != "pom.xml"')
   if [ -n "$foreign" ]; then
@@ -217,9 +256,16 @@ if [ "$(git rev-parse HEAD)" != "$JNI_REVISION" ]; then
     echo >&2 "Nothing was changed. Use a fresh work directory, or commit/stash those changes."
     exit 1
   fi
+  case $(pom_state HEAD) in
+    pristine) ;;
+    versioned) install_pom "$POM_TMP/pristine" ;; # undo only this script's own edit before switching
+    *) refuse_pom HEAD ;;
+  esac
 fi
 git fetch origin "$JNI_REVISION"
 git checkout --detach "$JNI_REVISION"
+# Checked here, before the submodule or the staged patch is touched, so a refusal changes nothing.
+[ "$(pom_state "$JNI_REVISION")" != other ] || refuse_pom "$JNI_REVISION"
 
 # NOT --reference. A borrowed object store leaves an `objects/info/alternates` pointing at a path
 # outside the build container's bind mounts, and the build's own `git` calls then fail with
@@ -277,9 +323,16 @@ else
 fi
 
 # A distinct version, so NVIDIA's released 26.08.0 in the local repository is never overwritten.
-if ! grep -q "<version>$JNI_VERSION</version>" pom.xml; then
-  perl -0pi -e "s{(<artifactId>spark-rapids-jni</artifactId>\s*\n\s*<version>)[^<]+(</version>)}{\${1}$JNI_VERSION\${2}}" pom.xml
-fi
+# Applied only to the pinned revision's own pom.xml (see pom_state above); an edited file is refused.
+case $(pom_state "$JNI_REVISION") in
+  pristine)
+    install_pom "$POM_TMP/versioned"
+    echo "== pom.xml: project version set to $JNI_VERSION (the only change made to it)" ;;
+  versioned)
+    echo "== pom.xml: already the pinned file with version $JNI_VERSION" ;;
+  *)
+    refuse_pom "$JNI_REVISION" ;;
+esac
 grep -m1 -A1 "<artifactId>spark-rapids-jni</artifactId>" pom.xml
 
 [ "${SKIP_BUILD:-0}" = "1" ] && { echo "SKIP_BUILD=1, stopping before the build"; exit 0; }
@@ -296,8 +349,22 @@ echo "== building (arch $CMAKE_CUDA_ARCHITECTURES, $CPP_PARALLEL_LEVEL parallel 
   clean install
 
 echo
-# The Maven classifier follows the toolkit major version, the same way NVIDIA's build derives it.
-echo "== installed com.nvidia:spark-rapids-jni:$JNI_VERSION:cuda${CUDA_VERSION%%.*}"
-echo "   Point spark-jitudf at it with -Dcudf.jni.version=$JNI_VERSION, and put the jar ahead of"
-echo "   the RAPIDS distribution on the class path: both carry ai.rapids.cudf, and only this one"
-echo "   has the generalized ColumnView.transform."
+# The Maven classifier follows the toolkit major version, the same way NVIDIA's build derives it,
+# with -arm64 appended on aarch64.
+CLASSIFIER=cuda${CUDA_VERSION%%.*}
+[ "$(uname -m)" = aarch64 ] && CLASSIFIER=$CLASSIFIER-arm64
+REPO=${LOCAL_MAVEN_REPO:-$HOME/.m2/repository}
+JAR=$REPO/com/nvidia/spark-rapids-jni/$JNI_VERSION/spark-rapids-jni-$JNI_VERSION-$CLASSIFIER.jar
+echo "== installed com.nvidia:spark-rapids-jni:$JNI_VERSION:$CLASSIFIER"
+echo "   $JAR"
+echo
+echo "   This build ran with -DskipTests. To run the generalized binding's GPU tests"
+echo "   (TransformMultiTest) against what was just built:"
+echo "     cd $WORKDIR && CUDA_VERSION=$CUDA_VERSION LOCAL_MAVEN_REPO=$REPO \\"
+echo "       ./build/build-in-docker -Dtest=TransformMultiTest surefire:test"
+echo
+echo "   To use it, fold it into the RAPIDS distribution with spark-jitudf's swap script, which checks"
+echo "   architecture, CUDA major, pinned revisions and native linkage. Do not put this jar on the class"
+echo "   path next to the distribution: both carry ai.rapids.cudf and a libcudf.so."
+echo "     ./scripts/swap-cudf-jni.sh $JAR"
+echo "     VERIFY_ONLY=1 ./scripts/swap-cudf-jni.sh $JAR"

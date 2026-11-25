@@ -13,7 +13,8 @@ build and use this branch. This file documents only what the branch changes.
 Cut from NVIDIA's `release/26.08` at `1253310626da939c5924017d1c21e94d0932e0c1` ("Prepare
 cudf-spark release v26.08.1-rc"), the revision the released `rapids-4-spark_2.13-26.08.1.jar`
 records in its version-info. The independently validated revision of this branch is
-`477c7dde10f88c3704414e2fe393dc2bcc702e1a` (tag `tc-cudf-review-20261125`).
+`477c7dde10f88c3704414e2fe393dc2bcc702e1a` (tag `tc-cudf-review-20261125`). The release tag
+`tc-cudf-release-20261125` adds documentation and the JNI build helper's safety checks to it.
 
 `git diff 1253310626da939c5924017d1c21e94d0932e0c1 tc-cudf-review-20261125` shows every change:
 17 files, all listed below.

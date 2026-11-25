@@ -14,7 +14,7 @@ upstream.
 | `cudf-transform-generalized-jni.patch` | The patch (Java API, JNI entry point, tests). Its header explains the change in full. |
 | `build-cudf-spark-jni.sh` | Clones NVIDIA's `cudf-spark-jni` at the pinned revision, stages the patch and builds `com.nvidia:spark-rapids-jni:26.08.0-tcudf` in NVIDIA's build container. |
 | `cudf-submodule-state.sh` | Sourced by the build helper: restores the cuDF submodule between builds, touching only what an earlier build changed. |
-| `test-build-cudf-spark-jni.sh`, `test-cudf-submodule-state.sh` | Fixture tests for the two scripts on disposable repositories (24 and 44 checks). They never touch a real checkout. |
+| `test-build-cudf-spark-jni.sh`, `test-cudf-submodule-state.sh` | Fixture tests for the two scripts on disposable repositories (30 and 44 checks). They never touch a real checkout. |
 
 ## What the patch adds
 
@@ -51,7 +51,8 @@ entry point are untouched, there is no new C++ algorithm, and error reporting is
 | Memory and streams | cuDF's default stream and current RMM memory resource, like every other cuDF call. |
 
 **Tests** (in the patch, `java/src/test/java/ai/rapids/cudf/TransformMultiTest.java`, 35 tests,
-run on a GPU by the JNI build's own test phase) cover:
+on a GPU) cover the following. The build helper runs with `-DskipTests`; run them with the command
+in [Running the binding's tests](#running-the-bindings-tests).
 
 * one, two and three inputs, mixed input types, and every tested output type;
 * zero, one and a million rows;
@@ -95,15 +96,37 @@ toolkit is needed. The script prints what it is about to build and refuses ambig
 | `SKIP_BUILD=1` | | Prepare the tree and stop. |
 
 The result is `com.nvidia:spark-rapids-jni:26.08.0-tcudf:<classifier>` in the local Maven
-repository. To use it with Spark, fold it into the RAPIDS distribution with spark-jitudf's
-`scripts/swap-cudf-jni.sh` rather than adding it to the class path. That script also verifies that
-`transformMulti` links.
+repository; the helper prints its path. To use it with Spark, fold it into the RAPIDS distribution
+with spark-jitudf's `scripts/swap-cudf-jni.sh` rather than adding it to the class path. That script
+also verifies that `transformMulti` links. The helper's closing message gives both commands.
 
-**Safety.** The work directory is a clone of NVIDIA's repository. On a rerun the helper restores
-the cuDF submodule to its pin, but only after checking that every change in it is one the previous
-build made: the patch files it applied, identified by content. It backs up what it removes and
-refuses to touch anything else (an edited hunk, an unexpected file, a modified staged patch). It
-never runs `git reset --hard`, `git clean` or a forced checkout.
+## Running the binding's tests
+
+The helper builds with `-DskipTests`. From the work directory, with the same CUDA version and Maven
+repository as the build:
+
+```bash
+cd /path/to/work/cudf-spark-jni
+CUDA_VERSION=12.9.1 LOCAL_MAVEN_REPO=$HOME/.m2/repository \
+  ./build/build-in-docker -Dtest=TransformMultiTest surefire:test
+```
+
+Expected: `Tests run: 35, Failures: 0, Errors: 0, Skipped: 0`. `build-in-docker` defaults to
+CUDA 12.9.1, so pass the `CUDA_VERSION` you built with.
+
+**Safety.** Use a dedicated work directory: it is a clone of NVIDIA's repository that the helper
+manages. On a rerun the helper:
+
+* restores the cuDF submodule to its pin, but only after checking that every change in it is one
+  the previous build made (the patch files it applied, identified by content). It backs up what it
+  removes and refuses to touch anything else: an edited hunk, an unexpected file, a modified staged
+  patch;
+* edits only the project version in the work directory's `pom.xml`, and only when the file is
+  byte-for-byte the pinned revision's own or already carries exactly that edit. Any other change to
+  `pom.xml` makes it refuse before touching anything, and print the difference.
+
+It never runs `git reset --hard`, `git clean` or a forced checkout.
+`test-build-cudf-spark-jni.sh` exercises these cases (30 checks) on disposable repositories.
 
 ## Verifying an installed JNI
 

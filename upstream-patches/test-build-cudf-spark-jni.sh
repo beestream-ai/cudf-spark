@@ -195,6 +195,38 @@ rm -f "$w/thirdparty/cudf/spark-rapids-jni.patch"
 run_build "$w"
 check "succeeds and the leftover created file is gone" "[ $? = 0 ] && sub_clean $w"
 
+echo "--- an edited project version in pom.xml is refused, and nothing is touched"
+w=$(prepared pom-version)
+sed -i 's#<version>26.08.0-tcudf</version>#<version>26.08.0-mine</version>#' "$w/pom.xml"
+before=$(snapshot "$w")
+run_build "$w"
+check "refuses" "[ $? != 0 ] && grep -q 'pom.xml has changes this script did not make' $w.out"
+check "the edited version survives, and every byte is unchanged" "grep -q '26.08.0-mine' $w/pom.xml && [ \"\$(snapshot $w)\" = \"\$before\" ]"
+
+echo "--- an unrelated pom.xml edit is refused, and nothing is touched"
+w=$(prepared pom-other)
+printf '<!-- my local build setting -->\n' >> "$w/pom.xml"
+before=$(snapshot "$w")
+run_build "$w"
+check "refuses" "[ $? != 0 ] && grep -q 'pom.xml has changes this script did not make' $w.out"
+check "every byte is unchanged" "[ \"\$(snapshot $w)\" = \"\$before\" ]"
+
+echo "--- the script's own version edit is recognised on a rerun"
+w=$(prepared pom-own)
+run_build "$w"
+check "succeeds and reports the version as already set" "[ $? = 0 ] && grep -q 'already the pinned file with version 26.08.0-tcudf' $w.out"
+
+echo "--- moving to a new pinned revision undoes only the script's own pom.xml edit"
+w=$(prepared pom-move)
+printf 'release notes\n' > "$JNI/NOTES"
+git -C "$JNI" add NOTES && git -C "$JNI" commit -q -m "next revision"
+OLD_REV=$JNI_REV
+JNI_REV=$(git -C "$JNI" rev-parse HEAD)
+run_build "$w"
+moved=$?
+check "succeeds at the new revision with the version set again" "[ $moved = 0 ] && [ \"\$(git -C $w rev-parse HEAD)\" = $JNI_REV ] && grep -q '<version>26.08.0-tcudf</version>' $w/pom.xml"
+JNI_REV=$OLD_REV
+
 echo
 echo "=== CHECKS: $((PASS + FAIL)), FAILURES: $FAIL ==="
 [ "$FAIL" = 0 ]

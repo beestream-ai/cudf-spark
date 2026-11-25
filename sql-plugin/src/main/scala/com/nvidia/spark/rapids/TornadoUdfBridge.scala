@@ -150,7 +150,11 @@ object TornadoUdfBridge extends Logging {
    *
    * @return a `RapidsUDF` to put in the plan, or `None` to leave the UDF alone.
    */
-  def tryCompile(expr: ScalaUDF, conf: RapidsConf): Option[RapidsUDF] = {
+  def tryCompile(expr: ScalaUDF, conf: RapidsConf): Option[RapidsUDF] =
+    tryCompile(expr, conf, () => ())
+
+  def tryCompile(expr: ScalaUDF, conf: RapidsConf,
+      requireOriginalReceiver: Runnable): Option[RapidsUDF] = {
     val udfName = expr.udfName.getOrElse("UDF")
     if (!isEnabled(conf)) {
       return None
@@ -165,19 +169,18 @@ object TornadoUdfBridge extends Logging {
         conf.getStr(PROVIDER_KEY).getOrElse(DEFAULT_PROVIDER),
         true,
         Thread.currentThread().getContextClassLoader)
-      val method = providerClass.getMethod("tryCompile",
-        classOf[AnyRef],
-        classOf[Array[DataType]],
-        classOf[DataType],
-        java.lang.Boolean.TYPE,
-        java.lang.Boolean.TYPE,
-        classOf[String],
-        classOf[Array[String]],
-        classOf[String])
+      val signature = Array[Class[_]](classOf[AnyRef], classOf[Array[DataType]],
+        classOf[DataType], java.lang.Boolean.TYPE, java.lang.Boolean.TYPE, classOf[String],
+        classOf[Array[String]], classOf[String])
+      val method = try {
+        providerClass.getMethod("tryCompile", (signature :+ classOf[Runnable]): _*)
+      } catch {
+        case _: NoSuchMethodException => providerClass.getMethod("tryCompile", signature: _*)
+      }
 
       val inputTypes = expr.children.map(_.dataType).toArray
       val inputsNullable = expr.children.exists(_.nullable)
-      val result = method.invoke(null,
+      val args = Array[AnyRef](
         function,
         inputTypes,
         expr.dataType,
@@ -186,6 +189,11 @@ object TornadoUdfBridge extends Logging {
         udfName,
         reasonNames,
         diagnostics)
+      val result = if (method.getParameterCount == args.length) {
+        method.invoke(null, args: _*)
+      } else {
+        method.invoke(null, (args :+ requireOriginalReceiver): _*)
+      }
 
       result match {
         case udf: RapidsUDF =>

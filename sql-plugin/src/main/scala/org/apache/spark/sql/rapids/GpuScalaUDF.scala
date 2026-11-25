@@ -58,8 +58,16 @@ object GpuScalaUDFMeta {
       // only consulted when the user's UDF provides no GPU implementation of its own -- a
       // hand-written RapidsUDF always wins -- and only when the TornadoVM integration is switched
       // on. Evaluated once, lazily, so a plan that never asks never pays for the analysis.
+      // BridgeHostColumnProjection clones ScalaUDF.function by serializing it again on
+      // the worker. A record constructor or serialization hook may change the receiver twice.
+      private var needsOriginalReceiver = false
+
+      override def preventsTreeBridgeOptimization: Boolean = needsOriginalReceiver
+
+      override def isBridgeCompatible: Boolean = !needsOriginalReceiver && super.isBridgeCompatible
+
       lazy val tornadoFunc: Option[RapidsUDF] = if (opRapidsFunc.isEmpty) {
-        TornadoUdfBridge.tryCompile(expr, this.conf)
+        TornadoUdfBridge.tryCompile(expr, this.conf, () => needsOriginalReceiver = true)
       } else {
         None
       }

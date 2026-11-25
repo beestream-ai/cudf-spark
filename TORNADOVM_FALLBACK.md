@@ -1,40 +1,78 @@
 # The `feature/tornadovm-udf-fallback` branch
 
-This branch exists to support **[beestream-ai/spark-jitudf](https://github.com/beestream-ai/spark-jitudf)**,
-which compiles a Spark JVM UDF into a GPU kernel with TornadoVM and runs it over the cuDF column
-buffers in place.
+This branch of a fork of [NVIDIA/cudf-spark](https://github.com/NVIDIA/cudf-spark) supports
+**[beestream-ai/spark-jitudf](https://github.com/beestream-ai/spark-jitudf)**, which compiles
+eligible numerical Spark Java UDFs on the driver with TornadoVM's TC compiler and runs them on the
+GPU through cuDF's `transform`. Start there: its
+[README](https://github.com/beestream-ai/spark-jitudf/blob/redesign/driver-side-tc-cudf/README.md)
+and [INSTALL guide](https://github.com/beestream-ai/spark-jitudf/blob/redesign/driver-side-tc-cudf/docs/INSTALL.md)
+build and use this branch. This file documents only what the branch changes.
 
-If you are looking at this branch on its own, you probably want that repository first: it has the
-build instructions, the evaluation and the reproduction guide. This branch is a dependency of it,
-not a standalone thing.
+## Base
 
-## What it changes
+Cut from NVIDIA's `release/26.08` at `1253310626da939c5924017d1c21e94d0932e0c1` ("Prepare
+cudf-spark release v26.08.1-rc"), the revision the released `rapids-4-spark_2.13-26.08.1.jar`
+records in its version-info. The independently validated revision of this branch is
+`477c7dde10f88c3704414e2fe393dc2bcc702e1a` (tag `tc-cudf-review-20261125`).
 
-Ten files in `udf-compiler` and `sql-plugin`, about 380 lines, cut from `release/26.08` at the
-`v26.08.1-rc` commit.
+`git diff 1253310626da939c5924017d1c21e94d0932e0c1 tc-cudf-review-20261125` shows every change:
+17 files, all listed below.
 
-The RAPIDS `udf-compiler` translates a JVM UDF into Catalyst expressions. An expression tree cannot
-hold a loop, so a UDF containing one is declined and the batch crosses to the CPU row by row.
-Before this branch, the decline was reported only as a failure to translate. After it:
+## 1. Planner hook (`sql-plugin`, `udf-compiler`)
 
-| | |
+| File | Change |
 |---|---|
-| `UdfCompileResult` | The compiler says **why** it declined — the specific unsupported construct — instead of only that it did. |
-| `TornadoUdfBridge` | Looks up a provider that may be able to compile what the expression builder could not, and hands it the UDF. Off unless `spark.rapids.sql.tornadovm.enabled=true`. |
-| `LogicalPlanRules`, `GpuScalaUDF` | Let that second attempt happen during planning, so a UDF that cannot be compiled keeps exactly the path it already had. |
+| `udf-compiler/.../UdfCompileResult.scala` (new) | The RAPIDS UDF compiler reports **why** it declined a UDF (the unsupported construct), not only that it did. |
+| `udf-compiler/.../LogicalPlanRules.scala`, `GpuScalaUDF.scala`, `CFG.scala`, `CatalystExpressionBuilder.scala`, `LambdaReflection.scala`, `Instruction.scala` (two shims) | Carry that reason through, so a later provider can decide whether it is worth trying. |
+| `sql-plugin/.../TornadoUdfBridge.scala` (new) | Looks up the provider class named by `spark.rapids.sql.tornadovm.provider` (default `ai.beestream.jitudf.TornadoUdfProvider`) through the context class loader, calls its static `tryCompile(...)` reflectively with the UDF function object, input types, output type, nullability, determinism and the decline reasons, and returns the provider's `RapidsUDF` or `None`. Off unless `spark.rapids.sql.tornadovm.enabled=true`. Records each decision. |
+| `sql-plugin/.../GpuScalaUDF.scala` (`GpuScalaUDFMeta`) | When a `ScalaUDF` has no hand-written `RapidsUDF`, asks the bridge during `tagExprForGpu`. A compiled UDF becomes `GpuScalaUDF` (`gpu_<name>`) around the provider's `RapidsUDF`; otherwise the expression keeps the RAPIDS behavior of the release. |
 
-The provider class is named by `spark.rapids.sql.tornadovm.provider`, defaulting to
-`ai.beestream.jitudf.TornadoUdfProvider`. Nothing changes until the config is set: with the
-feature off, this branch behaves as the release it was cut from.
+With `spark.rapids.sql.tornadovm.enabled=false` (the default) the branch behaves like the release.
 
-## Building it
+### Original-receiver fallback (validated fix, 477c7dd)
 
-`scripts/build-rapids-patch.sh` in spark-jitudf builds the changed sources through this project's
-own reactor and replaces exactly those classes in the released distribution jar. See
-[REPRODUCING.md](https://github.com/beestream-ai/spark-jitudf/blob/main/REPRODUCING.md) there.
+RAPIDS' CPU bridge (`spark.rapids.sql.expression.cpuBridge.enabled`, default `true`) evaluates a
+declined UDF through `BridgeHostColumnProjection`, which clones `ScalaUDF.function` on the worker by
+**serializing it a second time** (`cloneFunction` → `Utils.clone`). For most UDFs that is harmless.
+For a UDF whose deserialization is not idempotent, the result changes. Examples are a Java record
+whose canonical constructor transforms a component, or a `readResolve` that rebuilds state.
 
-## Relationship to upstream
+The provider's `tryCompile` therefore takes a `Runnable requireOriginalReceiver` as an optional
+last argument (the bridge falls back to the old signature if the provider lacks it). The provider
+calls it when worker cloning cannot be proven to preserve the receiver. `GpuScalaUDFMeta` then
+reports `isBridgeCompatible = false` and `preventsTreeBridgeOptimization = true` for that
+expression, so the UDF is evaluated on the receiver Spark deserialized once:
 
-A fork of [NVIDIA/cudf-spark](https://github.com/NVIDIA/cudf-spark), kept so the branch is
-cloneable. Everything on it stays under the RAPIDS project's Apache 2.0 licence with its file
-headers intact; new files follow the same convention as their neighbours.
+* default settings: RAPIDS keeps that projection on Spark's CPU `Project` (any compiled sibling UDF
+  in the same projection runs on the CPU too, with correct results);
+* `spark.rapids.sql.rowBasedUDF.enabled=true`: the projection stays a `GpuProject`, the declined UDF
+  runs as `gpu_row_based_<name>` and compiled siblings stay `gpu_<name>`.
+
+The flag is set while the expression is tagged, before RAPIDS makes bridge decisions. With the
+TornadoVM hook disabled, the stock bridge behavior applies unchanged.
+
+## 2. Generalized cuDF `transform` JNI binding (`upstream-patches/`)
+
+The released cuDF Java binding exposes `ColumnView.transform(String udf, boolean isPtx)`: one input
+column, INT32 output, no null-awareness. libcudf's `cudf::transform_extended` already supports
+multiple inputs, any fixed-width output type, null-aware execution and an error channel. The patch
+widens the binding to reach them. It is a patch plus a build helper, not a change to this repository's
+Scala code: [upstream-patches/README.md](upstream-patches/README.md).
+
+`pom.xml` gains only a comment documenting `-Dspark-rapids-jni.version=26.08.0-tcudf`; the default
+dependency stays NVIDIA's released `26.08.0`, so an ordinary build of this fork needs nothing built
+locally.
+
+## Building
+
+`spark-jitudf`'s `scripts/build-rapids-patch.sh` builds this branch's `udf-compiler` and
+`sql-plugin` for Spark 4.0.4 through the fork's own Maven reactor and replaces exactly the classes
+compiled from the changed sources in `spark404/` and `spark-shared/` of NVIDIA's released 26.08.1
+jar. A full distribution build of all 25 Spark shims is not needed for Spark 4.0.4.
+
+## Licence
+
+Everything on this branch stays under the RAPIDS project's Apache License 2.0, with its file
+headers and `NOTICE` intact. New Scala files use the repository's standard Apache 2.0 file header,
+as its copyright check expects. The scripts in `upstream-patches/` carry a Beestream Ltd Apache 2.0
+header.
